@@ -1,0 +1,372 @@
+---
+title: "Ex2_GSE163165_analysis"
+author: "Kelly J. Cardona"
+date: "1/29/2024"
+output: html_document
+---
+## Individual exercise 2:
+
+## Identify a data-set related to Monocytes in bulk RNA-seq and run the complete pipeline. Generate a report.
+
+This report contains the result of the analysis performed on the dataset GSE163165. This dataset derived  
+from the publication:"The response of two polar monocyte subsets to inflammation" authored by Vishnyakova et al, in July 2021 (https://www.sciencedirect.com/science/article/pii/S0753332221003991?via%3Dihub#sec0135). The transcriptomic profiling was performed to analyze the response of CD14+ macrophages derived from monocytes to an inflammatory stimuli induced with LPS.The experimental design consisted in two groups a control group of non stimulated CD14+ macrophages and the LPS group constituted by CD14+ macrophages supplemented with lipopolisacarides to induce innmune activation.Each group was conformed by three samples. For this analysis, the parameters and methodologies presented by the authors in the methods of the paper have been recreated.However some methodological details are omitted on the paper, on those I have used my own criteria to decided the tools and parameters to use. 
+
+### Part 1: Load and prepare the data
+First we have to collect all the necessary information for the analysis from GEO.
+```{r}
+# load counts table from GEO
+urld <- "https://www.ncbi.nlm.nih.gov/geo/download/?format=file&type=rnaseq_counts"
+path <- paste(urld, "acc=GSE163165", "file=GSE163165_raw_counts_GRCh38.p13_NCBI.tsv.gz", sep="&");
+GSE163165_count <- as.matrix(data.table::fread(path, header=T, colClasses="integer"), rownames=1)
+nrow(GSE163165_count) #39376 genes
+
+# load the metadata information 
+
+library(GEOquery)
+## https://bioconductor.org/packages/release/bioc/vignettes/GEOquery/inst/doc/GEOquery.html
+gds <- getGEO("GSE163165")
+Meta_GSE163165 <- pData(gds$GSE163165_series_matrix.txt.gz@phenoData)
+#keep only relevant information for metadata
+Meta_GSE163165 <- Meta_GSE163165[,c("title","source_name_ch1","characteristics_ch1","characteristics_ch1.1","cell type:ch1","gender:ch1")]
+head(Meta_GSE163165, n=3)
+```
+For some reason the metadata does not contains a column to discriminate between the two groups: treated and untreated cells so I created it based on the information on the column "title" 
+```{r}
+Meta_GSE163165$treatment <- c("Control", "LPS", "Control", "LPS", "Control", "LPS")
+#I will use this new column as factor
+Factors_GSE163165 <- Meta_GSE163165[,c("treatment")]
+```
+Now, let's Collect biological information to run NOISeq QC later. NOISeq require as an input the counts, a factor (the variable of interest in our analysis/comparison) and some biological information: such as gene size, localization in chromosome, gene byotype and GC content. 
+```{r}
+# Write the gene ids in a txt file.
+#write.table(rownames(GSE163165_count),"./gene_names.entrez.txt",
+            #col.names = FALSE,row.names = FALSE,quote=F)
+
+#Upload the annotations obtained from BioMart
+# Import the information
+annotgene <- read.csv("./mart_export_GSE163165.txt",sep="\t",header = T)
+# How many genes do I get annotated?
+sum(rownames(GSE163165_count) %in% annotgene$NCBI.gene..formerly.Entrezgene..ID) #25898
+# Filter the annotation to keep only cannonical genes
+annotgene <- annotgene[annotgene$Chromosome.scaffold.name %in% c(as.character(1:22) ,"X","Y"),]
+nrow(annotgene) #26105
+sum(rownames(GSE163165_count) %in% annotgene$NCBI.gene..formerly.Entrezgene..ID) #25872
+# Filter annotation to remove duplicated genes 
+annotgene_filt <- annotgene[!duplicated(annotgene$NCBI.gene..formerly.Entrezgene..ID),]
+#Verify all size match ok
+sum(rownames(GSE163165_count) %in% annotgene$NCBI.gene..formerly.Entrezgene..ID) #25872
+sum(annotgene_filt$NCBI.gene..formerly.Entrezgene..ID %in% rownames(GSE163165_count)) #25872
+#Now I can do the assignation of gene names as the rownames
+## Overlap between annotation and genes
+rownames(annotgene_filt) <- as.character(annotgene_filt$NCBI.gene..formerly.Entrezgene..ID)
+sum(as.character(rownames(annotgene_filt)) %in% rownames(GSE163165_count)) #25872 ok!
+# For NOISeq QC Work only with the annotated genes! lets filter the counts
+GSE163165_count_filt <- GSE163165_count[rownames(GSE163165_count) %in% rownames(annotgene_filt),]
+#keep the excluded just in case
+GSE163165_count_exc <-GSE163165_count[!(rownames(GSE163165_count) %in% rownames(annotgene_filt)),]
+#order to keep same order of samples and genes always
+annotgene_ord <- annotgene_filt[rownames(GSE163165_count_filt ),]
+#checking once more all the sizes fit
+sum(rownames(annotgene_ord)==rownames(GSE163165_count_filt)) #25872 ok!
+```
+### Part 2: Exploratory analysis with NOISeq
+
+NOISeq is a R package for quality control of count data, it allow us to identify and control outliers or weather our data has any bias. With NOISeq we can monitor the quality of our data, take better decisions to improve our analysis, and be aware about the features of our data that can bias the interpretation of our results. 
+
+```{r}
+library(NOISeq)
+
+Factors_GSE163165 <- data.frame(Meta_GSE163165 [ colnames(GSE163165_count_filt),c("treatment")])
+colnames(Factors_GSE163165)[1]<- "Group"
+#additional biological data in the correct format
+lengthuse <- abs(annotgene_ord$Gene.end..bp.-annotgene_ord$Gene.start..bp.)
+names(lengthuse) <- rownames(annotgene_ord)
+head(lengthuse, n=3)
+gc <- annotgene_ord$Gene...GC.content
+names(gc) <- rownames(annotgene_ord)
+head(gc, n=3)
+biotype <-annotgene_ord$Gene.type
+names(biotype) <- rownames(annotgene_ord)
+head(biotype, n=3)
+chromosome <- annotgene_ord[,c("Chromosome.scaffold.name","Gene.start..bp.","Gene.end..bp.")]
+head(chromosome, n=3)
+#but I don't like the extended names of the columns, so lets rename it. 
+colnames(chromosome) <- c("Chromosome","start","end")
+head(chromosome, n=3)
+
+data_NOISEQ <- readData(data = GSE163165_count_filt,
+                        length=lengthuse,
+                        gc=gc,
+                        biotype= biotype ,
+                        chromosome = chromosome ,
+                        factors = Factors_GSE163165)
+
+```
+
+**Byotype detection:**plot the abundance of the different biotypes (e.g protein coding, lnc-RNA etc) in the genome with % of genes detected in the sample/condition and within the sample/condition.
+```{r echo=FALSE}
+myexplodata <- dat(data_NOISEQ, type = "biodetection")
+explo.plot(myexplodata, plottype = "persample")
+```
+
+**Saturation:**Represent the number of detected genes (counts>0) per sample across different sequencing depths. 
+```{r echo=FALSE}
+mysaturation = dat(data_NOISEQ, k = 0, ndepth = 7, type = "saturation")
+explo.plot(mysaturation, toplot = 1, samples = 1:6, yleftlim = NULL, yrightlim = NULL) 
+```
+
+**Length bias:**Mean gene expression per each length bin. A fitted curve and diagnostic test are also produced.
+```{r echo=FALSE}
+mylengthbias = dat(data_NOISEQ, factor = "Group", type = "lengthbias")
+explo.plot(mylengthbias, samples = NULL, toplot = "global")
+```
+
+**GC Bias:** Mean gene expression per each GC content bin.A fitted curve and diagnostic test are also produced.
+```{r echo=FALSE}
+myGCbias = dat(data_NOISEQ, factor = "Group", type = "GCbias")
+explo.plot(myGCbias, samples = NULL, toplot = "global")
+```
+
+**Exploratory PCA:** Principal component analysis score plots for PC1 vs PC2
+```{r echo=FALSE}
+myPCA = dat(data_NOISEQ, type = "PCA")
+explo.plot(myPCA, factor = "Group")
+
+```
+
+### Part 3. Differential expression analysis with DESeq 2 and Comparison with the original Manuscript results
+
+I am trying to reproduce the analysis performed by the authors in the original paper described mainly
+in the supplementary material.For some aspects they don't specify their criteria so I have made my 
+own decisions.
+```{r}
+#DEA with DESeq2 since was the tool used in the publication
+library(DESeq2)
+#creating object
+GSE163165_DESeq2 <- DESeqDataSetFromMatrix(countData = GSE163165_count_filt,
+                                           colData = pData(data_NOISEQ),
+                                           design = ~ Group)
+#run DE analysis
+GSE163165_DESeq2 <- DESeq(GSE163165_DESeq2)
+```
+### Counts filtering
+In the paper the authors does not specify weather they apply or not, any kind of filtering to the originalcounts to remove low express genes. So I have decided to filter the data by using the HTSfilter
+package from R.The HTSfilter performs a filtering based on a global jaccard similarity index in order to
+identify genes with low, constant levels of expression across one or more experimental conditions.
+```{r}
+library(HTSFilter)
+#S.len=number of tested threshold, default is 100, I put 50 to reduce computational time
+filter <- HTSFilter(GSE163165_DESeq2, s.len=50, plot=FALSE)$filteredData
+class(filter)
+dim(filter)
+```
+***Important*** DESeq2 implements an independent filtering procedure by default in the results function; 
+this filter is another alternative and does not need to be used in addition to the one included in HTSFilter.So to make use of HTSFilter within the DESeq2 pipeline, the argument independentFiltering=FALSE is used when calling the results function in DESeq2.
+```{r}
+res <- results(filter, independentFiltering=FALSE)
+summary(res)
+```
+Now let's start exploring our DEGs
+```{r}
+#Let's plot the distribution of our genes
+plotMA(res, ylim=c(-2,2))
+```
+
+I like how my MA plot looks, I would even consider not to shrink the LogFC  since the error in FC calculation seems to be uniform (the distribution of the dots is more or less uniform both with low or high number of counts).The HTSfilter helped me to control the possible false positives well. However, I applied the HTSfilter since its use is described in the methods of the paper.
+```{r}
+res_shrink <- lfcShrink(filter, coef = c('Group_LPS_vs_Control'))
+plotMA(res_shrink, ylim=c(-2,2))
+```
+
+As I expected, I don't see major differences in the plot. The error on LFC was properly controlled.
+now, lets explore a bit more the data. Filtering DEGs according to the thresholds reported in the paper: log2FC > 2( meaning a FC of 4) and P-Value < 10e-2 
+```{r}
+degs = as.data.frame(res_shrink)[which(res_shrink$pvalue <= 0.1 & abs(res_shrink$log2FoldChange)>2),] 
+dim(degs)
+head(degs,n=3)
+```
+
+I have obtained substantially less genes than the original author, probably because, since I applied the HTSfilter and then the function for shirink my criteria was very strigent. Now, lets explore if my results are still representative of the biological context. 
+As a next step. The table 1 on the paper show the top 30 up and downregulated genes in LPS vs Controls, lets check if we have the same genes as top DEGs. 
+```{r}
+#Extracting the top genes.
+topdown <- degs[order(degs$log2FoldChange)[1:30],]
+head(topdown, n=3)
+topup <- degs[order(degs$log2FoldChange, decreasing = TRUE)[1:30],]
+topup
+head(topup,n=3)
+#Now lets extract the entrez id to convert it to gene name with Biomart to know if the identity of our top genes 
+ids_down <- rownames(topdown)
+ids_up <- rownames(topup)
+# Write the gene ids in a txt file.
+#write.table(ids_down,"./ids_top_up.txt",
+            #col.names = FALSE,row.names = FALSE,quote=F)
+#write.table(ids_up,"./ids_top_down.txt",
+            #col.names = FALSE,row.names = FALSE,quote=F)
+# Upload the annotations from Biomart
+namesup <- read.csv("./mart_export_top_up.txt",sep="\t",header = T)
+namesdown <- read.csv("./mart_export_top_down.txt",sep="\t",header = T)
+#fixing rownames for compatibility
+rownames(namesup) <-namesup$NCBI.gene..formerly.Entrezgene..ID
+namesup$NCBI.gene..formerly.Entrezgene..ID = NULL
+rownames(namesdown) <-namesdown$NCBI.gene..formerly.Entrezgene..ID 
+namesdown$NCBI.gene..formerly.Entrezgene..ID =NULL
+
+#merging my top DEGs with the annotation from Biomart
+top_degs_up <-merge(topup,namesup,by='row.names', all=TRUE)
+head(top_degs_up, n=3)
+top_degs_down <-merge(topdown,namesdown,by='row.names',all=TRUE)
+head(top_degs_down, n=3)
+```
+With the information we have collected to this point lets make some venn diagrams to check how many of our top genes are also reported in the paper
+```{r}
+library(VennDiagram)
+library(RColorBrewer)
+#vectors with the list of top genes from the paper
+top_paper_up <-c("SERPINB7", "IL12B", "BCL2L14", "LOC101929800", "BX255923.3", "IDO1", "IL2RA",
+                 "CSF3", "MT1JP", "CCL8", "IRG1", "CXCL13", "LOC102723642", "VEGFC", "IFITM1",
+                 "IDO2", "LAMP3", "HAS1", "SERPINB4", "FBXO39", "RSAD2", "IFI44L", "CCL19",
+                 "C1QTNF1", "LOC101929319", "GBP1P1", "CCL20", "TNFAIP6", "TNNT2", "UPB1")
+top_paper_down <- c("C3orf22", "LYPD1", "ASB9", "MRO", "MYBL2", "SPC25", "TPD52L1", "TMEM37",
+                    "ASIC", "MYZAP", "APLN", "PPAPDC1A", "SKA3", "SAMD13", "PNPLA3", "MYLK2",
+                    "CMBL", "RRM2", "MCM10", "FAM111B", "CCSER1", "PGBD5", "TLR5", "GAL3ST4",
+                    "FFAR4", "LOC102724574", "GABBR2", "DNASE2B", "PBK", "HJURP")
+# Chart up
+vup <- venn.diagram(
+  x = list(top_paper_up,namesup$Gene.name),
+  category.names = c("Top30 Up paper", "Top 30 Up me"),
+  filename = 'venn_diagram_up_degs.png',
+  output=TRUE,
+  # Circles
+  lwd = 2,
+  lty = 'blank',
+  fill = c("blue","yellow"),
+  # Numbers
+  cex = 1,
+  fontface = "bold",
+  fontfamily = "sans",
+)
+
+#chart down
+vdown <- venn.diagram(
+  x = list(top_paper_down,namesdown$Gene.name),
+  category.names = c("Top30 Up paper", "Top 30 Up me"),
+  filename = 'venn_diagram_down_degs.png',
+  output=TRUE,
+  # Circles
+  lwd = 2,
+  lty = 'blank',
+  fill = c("blue","yellow"),
+  # Numbers
+  cex = 1,
+  fontface = "bold",
+  fontfamily = "sans",
+)
+```
+As we can observe from previous plots, the identity of the top genes reported on the paper with the genes identified with this analysis is highly similar.Then, even if my filtering was strict I could capture the most relevant genes. 
+
+### Part 4. Visualization, Functional annotation and comparison with the original Manuscript results
+Figure 4.D in the manuscript present a volcano plot with the overall results of the DE analysis on LPS estimulated monocites and controls. I recreate the figure for comparisons.
+```{r echo=FALSE}
+knitr::include_graphics("./fig4d.png")
+```
+Now my figure looks like
+```{r}
+#lets do some modification to our results to facilitate the plotting
+#Adding relevant information to the DEGs, like: direction, hgcn symbol
+
+#I fixed my problem with BiomaRt following this thread (https://stackoverflow.com/questions/77370659/error-failed-to-collect-lazy-table-caused-by-error-in-db-collect-using)
+library(biomaRt)
+
+ensembl=useMart(biomart = "ENSEMBL_MART_ENSEMBL",dataset="hsapiens_gene_ensembl")
+databaseGenesEnsembl <- getBM(
+  attributes=c("entrezgene_id", "hgnc_symbol"),
+  values=rownames(res_shrink),
+  filters="entrezgene_id",
+  mart=ensembl
+)
+
+#results
+full_results=merge(as.data.frame(res_shrink), databaseGenesEnsembl,by.x="row.names", by.y="entrezgene_id", all.x=TRUE)
+#let's create a column to indicate weather a gene is deg or not
+full_results$DE="N.S."
+full_results$DE[which(full_results$Row.names %in% rownames(degs)[which(degs$log2FoldChange>0)])]="UP"
+full_results$DE[which(full_results$Row.names %in% rownames(degs)[which(degs$log2FoldChange<0)])]="DOWN"
+full_results$condlabel <- ifelse(full_results$padj< 1e-40, as.character(full_results$hgnc_symbol), NA)
+
+#lets produce a volcano plot like the one the paper
+library(ggplot2)
+library(ggrepel)
+
+threshold_pval=0.1
+
+vp <- ggplot(data=full_results, aes(x=log2FoldChange, y=-log10(pvalue), col=DE,label=hgnc_symbol, ensembl=Row.names)) +
+  geom_point(alpha = 0.5) + 
+  theme_minimal() +
+  scale_color_manual(values=c("blue","black","red")) +
+  geom_vline(xintercept=c(-2, 2), linetype="dashed") +
+  geom_hline(yintercept=-log10(threshold_pval), linetype="dashed") +
+  geom_text_repel(aes(label = condlabel), show.legend =FALSE)
+
+vp
+
+```
+I am satisfied with the result, most of the representative genes are shared and the global distribution of genes is similar.
+As a final step I performed a ORA with panther, the methods of the paper does not specify the tool used for the ORA but indicate the correction method, ontologies and statitical test. So I tried to recreate it and compare with the supplementary table 2 (please refer to the world file 1-s2.0-S0753332221003991-mmc1)
+```{r}
+###LETS DO FUNCTIONAL ANNOTATION!
+#we are going to perform a ORA with Panther database as in the paper
+library(rbioapi)
+
+#First lets retrieve the avaiable gene sets to use from panther.
+#rba_panther_info(what = "datasets")
+#the ones we are interested in are those used in the paper: 
+#1                       GO:0003674                 molecular_function 10.5281/zenodo.8436609
+#2                       GO:0008150                 biological_process 10.5281/zenodo.8436609
+
+degs_up <- subset(degs,degs$log2FoldChange>0)
+degs_down <- subset(degs,degs$log2FoldChange<0)
+
+#ORA for upregulated genes
+panther_bp_up <- rba_panther_enrich(genes=rownames(degs_up),
+                                    organism = 9606, #homo sapiens
+                                    annot_dataset = "GO:0008150", #biological process
+                                    test_type = "FISHER",
+                                    correction = "FDR")
+head(panther_bp_up$result, n=5)  
+
+panther_mf_up <- rba_panther_enrich(genes=rownames(degs_up),
+                                    organism = 9606, #homo sapiens
+                                    annot_dataset = "GO:0003674", #molecular function
+                                    test_type = "FISHER",
+                                    correction = "FDR")
+head(panther_mf_up$result, n=5) 
+
+#ORA FOR Downregulated genes
+panther_bp_down <- rba_panther_enrich(genes=rownames(degs_down),
+                                    organism = 9606, #homo sapiens
+                                    annot_dataset = "GO:0008150", #biological process
+                                    test_type = "FISHER",
+                                    correction = "FDR")
+head(panther_bp_down$result, n=5)  
+
+panther_mf_down <- rba_panther_enrich(genes=rownames(degs_down),
+                                    organism = 9606, #homo sapiens
+                                    annot_dataset = "GO:0003674", #molecular function
+                                    test_type = "FISHER",
+                                    correction = "FDR")
+head(panther_mf_down$result, n=5) 
+```
+The terms are not identical as was expected but in general the trend is similar the upregulated genes are enriched in terms associated to inflammation and inmmune activity mediated by interferon, while the downregulated genes are more enriched in terms associated to metabolism and biochemical processes. 
+***In conclusion***, the analysis perfomed can recall many of the findings described on the paper but was not posible a 100% of reproducibility of the analysis and data since in the paper some technical details were missing. 
+
+### References
+1. P. Vishnyakova, A. Poltavets, E. Karpulevich, A. Maznina, V. Vtorushina, L. Mikhaleva, E. Kananykhina, A. Lokhonina, S. Kovalchuk, A. Makarov, A. Elchaninov, G. Sukhikh, T. Fatkhudinov.The response of two polar monocyte subsets to inflammation.Biomedicine & Pharmacotherapy,Volume 139,2021,111614,ISSN 0753-3322.https://doi.org/10.1016/j.biopha.2021.111614.
+
+2. Tarazona S, Furió-Tarí P, Turrà D, Pietro AD, Nueda MJ, Ferrer A, Conesa A. Data quality aware analysis of differential expression in RNA-seq with NOISeq R/Bioc package. Nucleic Acids Res. 2015 Dec 2;43(21):e140. doi: 10.1093/nar/gkv711. Epub 2015 Jul 16. PMID: 26184878; PMCID: PMC4666377.
+
+3. Evans C, Hardin J, Stoebel DM. Selecting between-sample RNA-Seq normalization methods from the perspective of their assumptions. Brief Bioinform. 2018 Sep 28;19(5):776-792. doi: 10.1093/bib/bbx008. PMID: 28334202; PMCID: PMC6171491.
+
+4.Rau A, Gallopin M, Celeux G, Jaffrezic F (2013). “Data-based filtering for replicated high-throughput transcriptome sequencing experiments.” Bioinformatics, 29(17), 2146-2152.
+
+5. Moosa Rezwani, Ali Akbar Pourfathollah, Farshid Noorbakhsh, rbioapi: user-friendly R interface to biologic web services’ API, Bioinformatics, Volume 38, Issue 10, May 2022, Pages 2952–2953, https://doi.org/10.1093/bioinformatics/btac172

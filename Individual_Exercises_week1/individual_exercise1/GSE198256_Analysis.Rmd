@@ -1,0 +1,395 @@
+---
+title: "JCI Insight Analysis"
+author: "Kelly J. Cardona"
+date: "1/26/2024"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Individual excercise 1:
+
+## Compare "Results from JCI Insight" vs "Results derived from your own analysis"
+
+This report contains the result of comparing the results of the RNAseq analysis reported in Braun et al,2022 (<https://insight.jci.org/articles/view/154183>) with the results obtained by myself using and modifiying the code provided by Prof. Gomez-Cabrero on the class.
+
+### Part 1: Load and prepare the data
+Getting the counts from GEO
+```{r} 
+urld <- "https://www.ncbi.nlm.nih.gov/geo/download/?format=file&type=rnaseq_counts"
+path <- paste(urld, "acc=GSE198256", "file=GSE198256_raw_counts_GRCh38.p13_NCBI.tsv.gz", sep="&");
+GSE198256_count <- as.matrix(data.table::fread(path, header=T, colClasses="integer"), rownames=1)
+```
+Getting the metadata
+```{r echo=FALSE}
+library(GEOquery)
+```
+ 
+```{r}
+## https://bioconductor.org/packages/release/bioc/vignettes/GEOquery/inst/doc/GEOquery.html
+gds <- getGEO("GSE198256")
+Meta_GSE198256 <- pData(gds$GSE198256_series_matrix.txt.gz@phenoData)
+Meta_GSE198256 <- Meta_GSE198256[,c("title","source_name_ch1","characteristics_ch1","characteristics_ch1.1","description","cell type:ch1","disease state:ch1")]
+
+Factors_GSE198256 <- Meta_GSE198256[,c("disease state:ch1")]
+```
+initial number of genes:
+```{r echo=FALSE}
+nrow(GSE198256_count)
+```
+Then we collect relevant biological information to later perform the filtering with NOISeq
+For this, we first export the gene's id to manually look for the relevant biological information
+in BioMart. This process could be also done using the BiomaRt package from R (I tried since I have used it before but I got an error, apparently because I am calling one of the attributes with the incorrect name, however I did not find any discrepancy between my call and the attribute list. I need to figure out what happened.)
+```{r}
+# Write the gene ids to a file, for uploading on BioMart web.
+write.table(rownames(GSE198256_count),"gene_names.entrez.txt",
+            col.names = FALSE,row.names = FALSE,quote=F)
+# Import the information
+annotgene <- read.csv("./Resources/mart_export (10).txt",sep="\t",header = T)
+```
+Let's check how many genes I get annotated
+```{r}
+sum(rownames(GSE198256_count) %in% annotgene$Entrezgene)
+```
+And the original number of genes in our count matrix was
+```{r}
+nrow(GSE198256_count)
+```
+As we can see we get annotations for less genes than those contained in the original table
+Since we want to use NOISeq for a quality control is ok to limit our genes to those that got
+annotations, however for posterior analysis we will use all the genes. Meanwhile, let's filter the genes. 
+```{r}
+# Filter the genes to keep only those annotated to cannonical chromosomes
+annotgene <- annotgene[annotgene$Chromosome %in% c(as.character(1:22) ,"X","Y"),]
+```
+The number of genes is reduced to:
+```{r}
+sum(rownames(GSE198256_count) %in% annotgene$Entrezgene) #25872
+```
+Some genes can also have more than one annotation, so lets remove the duplicates
+```{r}
+annotgene_filt <- annotgene[!duplicated(annotgene$Entrezgene),]
+sum(rownames(GSE198256_count) %in% annotgene$Entrezgene)
+sum(annotgene_filt$Entrezgene %in% rownames(GSE198256_count))
+```
+then, after removing duplicates we can asign the genenames as the rownames of our object
+```{r}
+## Overlap between annotation and genes
+rownames(annotgene_filt) <- as.character(annotgene_filt$Entrezgene)
+sum(as.character(rownames(annotgene_filt)) %in% rownames(GSE198256_count))
+```
+Now, we can work with the annotated genes
+```{r}
+GSE198256_count_filt <- GSE198256_count[rownames(GSE198256_count) %in% rownames(annotgene_filt),]
+GSE198256_count_exc <-GSE198256_count[!(rownames(GSE198256_count) %in% rownames(annotgene_filt)),]
+annotgene_ord <- annotgene_filt[rownames(GSE198256_count_filt ),]
+#let's check that the size are ok
+sum(rownames(annotgene_ord)==rownames(GSE198256_count_filt))
+```
+### Part 2: Exploratory analysis with NOISeq
+NOISeq is a R package for quality control of count data, it allow us to identify and control outliers or weather our data has any bias. With NOISeq we can monitor the quality of our data, take better decisions to improve our analysis, and be aware about the features of our data that can bias the interpretation of our results. 
+For quality control and exploration NOISeq require as an input the counts, a factor (the variable of interest in our analysis/comparison) and some biological information: such as gene size, localization in chromosome, gene byotype and GC content. 
+```{r echo=FALSE}
+library(NOISeq)
+```
+We are going to use the annotations we collected from BioMart to extract the additional biological information required by NOISeq, all the information is in annotgene_ord
+```{r echo=FALSE}
+head(annotgene_ord, n=3)
+```
+Now, from the previous one let's extract the biological data in the correct format required by
+NOISeq > gene id and value.
+```{r}
+#Adding additional biological data 
+lengthuse <- abs(annotgene_ord$end-annotgene_ord$start)
+names(lengthuse) <- rownames(annotgene_ord)
+gc <- annotgene_ord$GC
+names(gc) <- rownames(annotgene_ord)
+biotype <-annotgene_ord$type
+names(biotype) <- rownames(annotgene_ord)
+chromosome <- annotgene_ord[,c("Chromosome","start","end")]
+```
+Now, lets define the factors
+```{r}
+Factors_GSE198256 <- data.frame(Meta_GSE198256 [ colnames(GSE198256_count_filt),c("disease state:ch1")])
+colnames(Factors_GSE198256)[1]<- "Group"
+```
+Now, we have all the necessary information, let's create the NOISeq object.
+```{r}
+data_NOISEQ <- readData(data = GSE198256_count_filt,
+                        length=lengthuse,
+                        gc=gc,
+                        biotype= biotype,
+                        chromosome = annotgene_ord[,c("Chromosome","start","end")],
+                        factors = Factors_GSE198256)
+```
+Next, we can generate some exploratory plots to evaluate the quality of our data (I am not generating all available, just the most representatives) 
+
+**Byotype detection:**plot the abundance of the different biotypes (e.g protein coding, lnc-RNA etc) in the genome with % of genes detected in the sample/condition and within the sample/condition.
+```{r echo=FALSE}
+myexplodata <- dat(data_NOISEQ, type = "biodetection")
+explo.plot(myexplodata, plottype = "persample")
+```
+
+**Saturation:**Represent the number of detected genes (counts>0) per sample across different sequencing depths. It is also posible to generate the saturation plot for specific byotypes, like in the second example below. In that case represent the number of detected genes of the specific biotype across sequencing depths.
+```{r echo=FALSE}
+mysaturation = dat(data_NOISEQ, k = 0, ndepth = 7, type = "saturation")
+explo.plot(mysaturation, toplot = 1, samples = 1:34, yleftlim = NULL, yrightlim = NULL) 
+explo.plot(mysaturation, toplot = "protein_coding", samples = 1:34) 
+```
+
+**Length bias:**Mean gene expression per each length bin. A fitted curve and diagnostic test are also produced.
+```{r echo=FALSE}
+mylengthbias = dat(data_NOISEQ, factor = "Group", type = "lengthbias")
+explo.plot(mylengthbias, samples = NULL, toplot = "global")
+```
+
+**GC Bias:** Mean gene expression per each GC content bin.A fitted curve and diagnostic test are also produced.
+```{r echo=FALSE}
+myGCbias = dat(data_NOISEQ, factor = "Group", type = "GCbias")
+explo.plot(myGCbias, samples = NULL, toplot = "global")
+```
+
+**Exploratory PCA:** Principal component analysis score plots for PC1 vs PC2
+```{r echo=FALSE}
+myPCA = dat(data_NOISEQ, type = "PCA")
+explo.plot(myPCA, factor = "Group")
+```
+
+### Part 3: Normalization 
+An essential step in an RNA-Seq study is normalization, in which raw data are adjusted to account for factors that prevent direct comparison of expression measures. Errors in normalization can have a significant impact on downstream analysis, such as inflated false positives in differential expression analysis(Evans et al, 2018).There are multiple normalization methods.Some of them are:
+
+**RPKM:**Is a normalization by library size, aims to remove differences in sequencing depth simply by dividing the total number of reads in each sample.The RPKM method add a component to account for gene lenght as well. FPKM and ERPKM are variants of this method. After dividing by library size, the normalized counts reflect the proportion of total mRNA/cell taken up by each gene. If the total mRNA/cell is the same across conditions, this proportion reflects absolute mRNA/cell for each gene (Evans et al, 2018).
+In R we can do it using NOISeq as:
+```{r}
+myRPKM = rpkm(assayData(data_NOISEQ)$exprs, long = lengthuse, k = 0, lc = 1)
+```
+**UQUA:**The Upper Quartile normalization is a method of normalization by distribution. The Upper Quartile normalization divides each read count by the 75th percentile of the read counts in its sample (Bullard et al, 2010).
+In R we can do it with NOISeq as:
+```{r}
+myUQUA = uqua(assayData(data_NOISEQ)$exprs, long = lengthuse, lc = 0.5, k = 0)
+```
+**TMM:**The Trimmed mean of the M-values (TMM) is also a normalization by distribution, this approach chooses a sample as a reference sample, then calculate fold changes and absolute expression levels relative to that sample. The genes are trimmed twice by these two values, to remove differentially express genes, then the trimmed mean of the fold changes is found for each sample. Read counts are scaled by this trimmed mean and the total count of their sample. With NOISeq the TMM normalization can be applied as follows:
+```{r}
+myTMM = tmm(assayData(data_NOISEQ)$exprs, long = 1000, lc = 0)
+```
+### Part 4: Differential expression analysis with DESeq2 and Comparision with the Original Paper from Braun et al 2022, JCI Insight
+
+We start by creating the DESeq2 object for the analysis
+```{r}
+library(DESeq2)
+
+GSE198256_DESeq2 <- DESeqDataSetFromMatrix(countData = GSE198256_count_filt,
+                              colData = pData(data_NOISEQ),
+                              design = ~ Group)
+```
+Now, we will Modifying the labels to match the paper format and avoid warnings due to unacepted characters.
+```{r}
+pDataUSE <- pData(data_NOISEQ)
+pDataUSE[pDataUSE=="Healthy"] <- "Control"
+pDataUSE[pDataUSE=="Covid19: Acute infection"] <- "Acute"
+pDataUSE[pDataUSE=="Covid19: Recovery 3Mo"] <- "Early_recovery"
+pDataUSE[pDataUSE=="Covid19: Recovery 6Mo"] <- "Late_recovery"
+pDataUSE[,1] <- as.factor(pDataUSE[,1])
+```
+And let's try again
+```{r}
+GSE198256_DESeq2 <- DESeqDataSetFromMatrix(countData = GSE198256_count_filt,
+                                           colData = pDataUSE,
+                                           design = ~ Group)
+```
+Now, in the paper the authors mentioned they performed the DE analysis by comparing the different groups of COVID19 patients with the healthy controls. So, let's define the Controls as our reference group for the contrasts by using relevel function.
+```{r}
+GSE198256_DESeq2$Group <- relevel(GSE198256_DESeq2$Group, ref="Control")
+```
+With the current model we are including all genes from GSE198256_count_filt in our analysis, but we can remove the genes with low expression to avoid noise and bias in our DEGs. To do so, we will use the filtering criteria suggested by prof. Gomez-Cabrero in which we retain genes genes with counts >=10 in at least 6 samples (the size of the smallest group in our contrasts, that in this case correspond to the Early recovery group (n=6))
+```{r}
+smallestGroupSize <- 6
+keep <- rowSums(counts(GSE198256_DESeq2) >= 10) >= smallestGroupSize
+GSE198256_DESeq2_F <- GSE198256_DESeq2[keep,]
+nrow(GSE198256_DESeq2_F)
+```
+
+***Comparison with the paper***
+This is our first difference with Brauns et al,2022. Since their filtering criteria was to keep genes with counts >=20 in at least one sample. This filtering is more relaxed than ours, and using it we ended with more genes as we can see below:
+```{r}
+#Trying the filtering criteria used in the paper
+keep_paper <- rowSums(counts(GSE198256_DESeq2) >= 20) >= 1
+GSE198256_DESeq2_Paper <- GSE198256_DESeq2[keep_paper,]
+nrow(GSE198256_DESeq2_Paper)
+```
+Now, lets go back to our initial filter and perform the DEG analysis.
+```{r}
+GSE198256_DESeq2_F<- DESeq(GSE198256_DESeq2_F)
+GSE198256_res <- results(GSE198256_DESeq2_F)
+#Checking we have the correct contrasts, allways control as reference.
+resultsNames(GSE198256_DESeq2_F)
+```
+Now, lets explore the number of DEGs we obtain in each contrast.
+
+Initial DEGs Acute vs Control
+```{r}
+summary(results(GSE198256_DESeq2_F, contrast = c('Group', 'Acute', 'Control')))
+```
+Initial DEGs Early recovery vs Control
+```{r}
+summary(results(GSE198256_DESeq2_F, contrast = c('Group', 'Early_recovery', 'Control')))
+```
+Initial DEGs Late recovery vs Control
+```{r}
+summary(results(GSE198256_DESeq2_F, contrast = c('Group', 'Late_recovery', 'Control')))
+```
+Now lets explore a little our data with the MAplot
+```{r}
+plotMA(GSE198256_res, ylim=c(-2,2))
+```
+
+***Interpretation***
+From the previous plot we can see that at low A (x-axis) the M (y-axis) is more variable, in other words, from genes with few counts (low A) we got very variable LogFC (M), therefor most of this are errors. As expected the more we move to the right on the x-axis ( more counts) the plot get  more thigh, so the LogFC is less variable therefor the error is lower.To correct this problem, we shrink the fold changes, which consist in looks at the largest fold changes that are not due to low counts (the right on the x-axis) and uses these to inform a prior distribution. So the large fold changes from genes with lots of statistical information are not shrunk, while the imprecise fold changes (from genes with low counts) are shrunk.
+```{r}
+#now shrink the fold changes
+res_acute <- lfcShrink(GSE198256_DESeq2_F, coef = c('Group_Acute_vs_Control'))
+res_early <- lfcShrink(GSE198256_DESeq2_F, coef = c('Group_Early_recovery_vs_Control'))
+res_late <- lfcShrink(GSE198256_DESeq2_F, coef = c('Group_Late_recovery_vs_Control')) 
+```
+Let's plot again the MAPlot to look at the effect of shrinking.
+
+***Acute vs Control***
+```{r echo=FALSE}
+plotMA(res_acute, ylim=c(-2,2))
+```
+
+***Early recovery vs Control***
+```{r echo=FALSE}
+plotMA(res_early, ylim=c(-2,2))
+```
+
+***Late recovery vs Control***
+```{r echo=FALSE}
+plotMA(res_late, ylim=c(-2,2))
+```
+
+Now, let's filter our DEGs using the same criteria as the original author: FDR<0.5 and |FC| > 2. 
+Notice, A FC of 2 correspond to a log2fc = 1, since log2(2) = 1.
+```{r}
+deg_acute = as.data.frame(res_acute)[which(res_acute$padj < 0.05 & abs(res_acute$log2FoldChange)>1),]
+nrow(deg_acute) # 803 degs
+deg_early = as.data.frame(res_early)[which(res_early$padj < 0.05 & abs(res_early$log2FoldChange)>1),] 
+nrow(deg_early)# 574 degs
+deg_late = as.data.frame(res_late)[which(res_late$padj < 0.05 & abs(res_late$log2FoldChange)>1),] 
+nrow(deg_late)# 16 degs
+```
+
+***Comparison with the paper***
+As expected, the number of DEGs we obtain is not the same as the number of DEGs reported in the paper, since we have use different filtering criteria of the counts matrix and we did shrink (The paper does not specify if they did it also). We got more DEGs (n=803) in the contrast Acute vs Control while the authors reported 339 DEGs for the same contrast. In the second contrast Early recovery vs Control we have slighly higher number of DEGs (n=574) than those reported in the paper (n=521). For the last contrast, Late recovery vs Control we got only 16 DEGs.In concordance, the paper's authors mentioned they found "harldy any DEG" however they don't specify the number.
+
+### Part 5: Visualization and Comparision with the Original Paper from Braun et al 2022, JCI Insight
+I tried to recreate ***figure 6*** from the paper. Since is the main figure describing the transcriptomic profile of the monocytes during COVID19 recovery. 
+```{r echo=FALSE}
+knitr::include_graphics("./fg6_paper.png")
+library(ComplexHeatmap)
+library(circlize)
+library(ggplot2)
+```
+first I recreate the PCA
+```{r}
+#Transform the data for visualization
+vsd <- vst(GSE198256_DESeq2_F, blind=FALSE)
+
+pca <- plotPCA(vsd, intgroup=c("Group"), returnData = TRUE)
+ggplot(pca, 
+       aes(x = pca$PC1, 
+           y = pca$PC2, 
+           color = pDataUSE$Group)) +
+  geom_point() +
+  labs(x = "PC1: 41% variance", y = "PC2: 17% variance") +
+  stat_ellipse()
+```
+
+***Comparison with the paper***
+The distribution of the samples and the clusters in my PCA follows the same pattern as the PCA from the paper, there is a slighty difference in the variance percentage described by PC1 and PC2.
+
+Then I recreate the heatmap
+```{r}
+#subset expression table to degs in each category.  
+degslist <- paste(c(rownames(deg_acute),rownames(deg_early), rownames(deg_late))) #1339 genes
+#Keep only unique ids to avoid ploting same gene multiple times
+degslist <- unique(degslist) #1314 genes
+#Produce the z-score
+avsd <- assay(vsd)
+Z <- t(scale(t(avsd)))
+#Extract my genes of interest - DEGs
+Z_degs <- Z[rownames(Z) %in% degslist,]
+
+ha = HeatmapAnnotation(
+  df = pDataUSE$Group,
+  annotation_height = unit(4, "mm")
+)
+
+#seed for the clustering, this for reproducibility 
+set.seed(123)
+hm <- draw(Heatmap(Z_degs, name = "z-score", km = 5, top_annotation = ha,
+        show_row_names = FALSE, show_column_names = FALSE, cluster_columns = FALSE))
+```
+
+***Interpretation and Comparison with the paper***
+I have use the k-means method to produce 5 clusters as in the paper. The number of elements in my clusters differ form those proposed in the paper.Initially, because the DEGs are different. However I have a similar pattern of expression in my clusters.To corroborate, is necesary to verify weather the representative genes of each cluster are also present in my heatmap and if belongs to the clusters with similar paterns of expression (color).
+For this, I have extract the ids of the genes en each cluster using a code available in:https://github.com/jokergoo/ComplexHeatmap/issues/136 published by the user guidohooiveld
+```{r}
+rcl.list <- row_order(hm)  #Extract clusters (output is a list)
+# loop to extract genes for each cluster.
+   for (i in 1:length(row_order(hm))){
+     if (i == 1) {
+       clu <- t(t(row.names(Z_degs[row_order(hm)[[i]],])))
+       out <- cbind(clu, paste("cluster", i, sep=""))
+       colnames(out) <- c("GeneID", "Cluster")
+       } else {
+         clu <- t(t(row.names(Z_degs[row_order(hm)[[i]],])))
+         clu <- cbind(clu, paste("cluster", i, sep=""))
+         out <- rbind(out, clu)
+         }
+     }
+#check 
+head(out,n=3)
+```
+Then I exported the list of Ids in a text file to annotate the gene name in BioMart and compare with the cluster's representative genes reported on the paper.
+```{r}
+##export to later look for the gene name in bioMart and compare with the 
+#representative genes per cluster from the paper.
+#write.table(out, file= "gene_clusters.txt", sep="\t", quote=F, row.names=FALSE)
+#dim(out)
+out<-as.data.frame(out)
+#Load the annotations obtained from biomart
+annotclust <- read.csv("gene_names_clusters.txt",sep="\t",header = T)
+head(annotclust, n=3)
+#dim(annotclust)
+# [1] 1322    2 
+#bigger than expected, so we remove any duplicated data 
+annotclust <- annotclust[!duplicated(annotclust$GeneID), ] 
+sum(annotclust$GeneID %in% out$GeneID) #1314 ok
+#Then merge the list of genes on our clusters with the annotations of biomart to pair gene id and gene name 
+genes_cluster=merge(annotclust, out, by.y="GeneID", all.x=TRUE)
+head(genes_cluster, n=3)
+```
+
+Now that we have the gene name of our genes of interest, lets create a vector containing the names of the representative genes reported in Figure 6.B from Brauns et al, 2022. The representative genes reported on the paper are 84. The next step is subset our genes_cluster to extract those annotated as representative in the paper.
+```{r}
+rep_genes_paper <- c("DHCR24", "ACSL1", "ALOX15B", "HPGD", "MSMO", "LDHA1", "SCDDHFR", "MPO", "S100A12",
+               "S100A8", "CLU", "HMGB2", "VSIG4", "FCGR1A", "LAIR1", "CD163", "IFI27", "IL1R2",
+               "FLT3", "SQLE", "SPRY2", "PPARG", "CCL2", "CCL4", "CCL7", "CXCL1", "CXCL16", "CXCL2",
+               "TNFRSF12A", "CSF1", "IL1R1", "TNFSF14", "TNFSF8", "DDIT3", "EIF2AK3", "FOXO3", "HMGA1",
+               "JARID2", "IRF2BP2", "IRAK2", "IL1RN", "DOT1", "SOCS6L", "HAVCR2", "MAFF", "MAFB", "IL1B",
+               "GPR183", "CIITA", "C3", "FTH1", "KLF12", "HLA-DMA", "CLEC10A", "CSF1R", "HLA-DMB", 
+               "MAP3K14", "GPR183", "HLA-DQA1", "CD4", "VEGFA", "HLA-DQA2", "OSMa", "PTGER4", "HLA-DPA1",
+               "CLEC4A", "CSF1R", "HLA-DOA", "SRCCAMK2D", "KLF11", "HLA-DRA", "NRP1", "PDGFC", "HLA-DRB1",
+               "NR4A1", "NFE2L3", "ATF3", "JUNB", "NFKB2", "PLAG1", "METTL17", "APAF1", "HIST1H3C", "ZNF490")
+
+#look for the representative genes in my clusters. 
+my_rep_genes <- subset(genes_cluster, genes_cluster$Gene.name %in% rep_genes_paper)
+head(my_rep_genes, n =3)
+```
+
+In our clusters we identified 59 out of the 84 representative genes reported on the paper. And our genes partially share the clustering patern, for example in the paper the "HLA" family of genes are all clustering together, which is in agreement with our observation where the HLA family also belongs to the same cluster. Similarly, cluster II from Brauns and cluster 5 from has show a siliar pattern of expression and contains multiple genes in common. For more details refere to the comparative figure below. 
+```{r echo=FALSE}
+knitr::include_graphics("./cluster_comp.png")
